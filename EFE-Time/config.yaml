@@ -1,0 +1,200 @@
+# EFE-Time config
+#
+#
+# Run with:
+#   python openevolve-run.py \
+#     EFE-Time/initial_program.py \
+#     EFE-Time/evaluator.py \
+#     --config EFE-Time/config.yaml \
+#     --output EFE-Time/openevolve_output
+#
+# Authentication (pick one):
+#   Option A — Bedrock API Key (ABSK token):
+#     export AWS_BEARER_TOKEN_BEDROCK="your-ABSK-token"
+#
+#   Option B — Standard AWS credentials (if no api_key set below):
+#     export AWS_ACCESS_KEY_ID="..."
+#     export AWS_SECRET_ACCESS_KEY="..."
+#     export AWS_SESSION_TOKEN="..."  # optional
+#     Also: pip install boto3
+#
+# Set GIFT_EVAL env var to the GIFT-Eval data directory.
+# Set TS_DATASET env var to choose which dataset (default: hospital).
+
+max_iterations: 100
+checkpoint_interval: 10
+language: python
+
+# ── LLM (AWS Bedrock) ────────────────────────────────────────────────────────
+llm:
+  provider: bedrock
+  region: us-east-1
+  primary_model: "us.anthropic.claude-opus-4-6-v1"
+  primary_model_weight: 1.0
+  secondary_model: "us.anthropic.claude-sonnet-4-6"
+  secondary_model_weight: 0.0
+  api_key: "${AWS_BEARER_TOKEN_BEDROCK}"
+  temperature: 0.7
+  max_tokens: 8192
+  timeout: 120
+
+# ── Prompt ───────────────────────────────────────────────────────────────────
+prompt:
+  system_message: |
+    You are evolving a target transformation program for time series forecasting.
+
+    The program defines a TransformProgram class with three methods:
+    - fit(y_hist, meta) → state dict of fitted parameters
+    - transform(y, state) → transformed values
+    - inverse_transform(z, state) → original-scale values
+
+    The downstream forecasting model (Chronos-2) is fixed.
+    Your job is to find a transform that makes the series easier to forecast.
+
+    HOW IT WORKS:
+    At each forecast origin, the evaluator:
+    1. Passes the historical target window to fit() along with metadata
+    2. Transforms the history with transform()
+    3. Feeds the transformed history to Chronos-2
+    4. Inverse-transforms the forecast back to original scale
+    5. Scores MASE against the identity-transform baseline
+
+    META DICT AVAILABLE IN fit():
+    The meta parameter is a dict with these keys:
+    - prediction_length: forecast horizon (int)
+    - seasonal_period: e.g. 12 for monthly (int)
+    - length: total history length
+    - n_valid: non-NaN count
+    - mean, std, median: basic location/scale stats
+    - min_val, max_val, range: value range
+    - positive_frac: fraction of values > 0
+    - zero_frac: fraction of values == 0
+    - skewness: skew of the series
+    - cv: coefficient of variation (std/|mean|)
+    - trend_strength: R² of linear fit (0 = no trend, 1 = perfect trend)
+    - recent_mean, recent_std: stats of the last seasonal_period observations
+
+    Use these to decide WHICH transform family to use and HOW to parameterize it.
+    For example:
+    - High positive_frac + high skewness → shifted log1p
+    - Mixed positive/negative + high skewness → asinh
+    - Low skewness + low cv → identity might be best
+    - Large range + high cv → scaled transform
+
+    TRANSFORM FAMILIES TO EXPLORE:
+    - identity: no transform (the baseline you must beat)
+    - shifted log1p: shift = -min + eps, z = log1p(y + shift)
+    - signed log: z = sign(y) * log1p(|y|)
+    - asinh: z = asinh(y / scale), with scale fitted from data
+    - scaled asinh: z = asinh((y - center) / scale)
+    - bounded power: Box-Cox-like with clamped lambda
+    - piecewise: different transforms for different value ranges
+    - affine normalization: (y - center) / scale, e.g. mean/std, median/IQR,
+      median/MAD — robust variants often help when outliers are present
+    - recent-window normalization: use stats from the last seasonal_period
+      observations instead of the full history (useful for non-stationary series)
+    - detrending: z[i] = y[i] - (slope * i + intercept), fit slope/intercept
+      via linear regression. Inverse for the FORECAST must use
+      state["hist_len"] + np.arange(len(z)) for the time index, NOT
+      np.arange(len(z)) — see the CRITICAL hist_len section below.
+    - seasonal phase centering: subtract the mean of each phase i % seasonal_period
+      from y. Inverse forecast must use (state["hist_len"] + np.arange(len(z))) % s
+      for the phase index, NOT np.arange(len(z)) % s.
+    - composites: combine any of the above (e.g. detrend → asinh, or seasonal
+      centering → affine). Each step must be exactly invertible in reverse order.
+
+    WHAT TO VARY:
+    - Family choice based on meta dict
+    - Shift formula (min-based, percentile-based, etc.)
+    - Scale formula (std-based, IQR-based, MAD-based)
+    - Power parameter bounds
+    - Recent-window vs full-window statistics
+    - Branching logic (if/else based on meta values)
+
+    CRITICAL — hist_len AND THE FORECAST WORKFLOW:
+    fit() MUST store "hist_len": len(y_hist) in the returned state dict.
+    This is critical because transform() and inverse_transform() are called
+    on DIFFERENT-LENGTH arrays:
+    - transform() receives the full history (length T)
+    - inverse_transform() receives the forecast (length prediction_length)
+    For ANY position-dependent operation (detrending, time-varying scaling),
+    you MUST use state["hist_len"] to compute the correct time offset for
+    the forecast positions, NOT len(z). Example for detrending:
+      transform:  z[i] = y[i] - slope * i
+      inverse:    y[i] = z[i] + slope * (state["hist_len"] + i)
+    If you use np.arange(len(z)) in inverse_transform, it will produce
+    indices 0..11 instead of the correct 72..83, DESTROYING the forecast.
+
+    RULES — YOUR PROGRAM MUST:
+    - fit parameters using ONLY the history passed to fit()
+    - ALWAYS include "hist_len": len(y_hist) in the state dict
+    - NOT use future data
+    - NOT mutate input arrays (copy first)
+    - Preserve length, order, and NaN positions
+    - Return finite values (no Inf); NaN only where input had NaN
+    - Provide an exact inverse: |inverse(transform(y)) - y| < 1e-4
+    - Keep inverse stable slightly beyond observed transformed range
+    - inverse_transform MUST work on arrays of any length (not just hist_len)
+    - Be deterministic given the same input
+    - Return a dict from fit() (the state)
+
+    COMMON MISTAKES TO AVOID:
+    - Using np.arange(len(z)) in inverse_transform for position-dependent ops
+      (MUST use state["hist_len"] + np.arange(len(z)) for forecast positions)
+    - Dividing by zero (always add eps to denominators)
+    - log of negative numbers (check and shift first)
+    - Inverse that doesn't match forward (verify the math)
+    - Using np.log instead of np.log1p (log(0) = -inf)
+    - Forgetting to copy arrays before modifying
+    - State values that are NaN or Inf
+
+    FEEDBACK YOU WILL RECEIVE:
+    The evaluator provides an "evaluation_summary" artifact with:
+    - candidate_mase / baseline_mase: your MASE vs identity baseline
+    - mase_ratio: < 1.0 means you're better than baseline
+    - help_rate: fraction of series where you're better
+    Use this to understand WHERE your transform helps and hurts.
+
+    SCORING:
+    score = 0.5 + (1 - candidate_MASE/baseline_MASE) * 5.0
+    - Score 0.5 = matches identity baseline
+    - Score > 0.5 = beating baseline (good!)
+    - Score < 0.5 = worse than baseline (bad)
+    - 10% MASE reduction → score 1.0
+
+    STRATEGY:
+    1. Start by understanding the meta dict values
+    2. Choose an appropriate transform family
+    3. Fit parameters carefully from the history using meta dict statistics
+    4. Verify your inverse math is correct
+    5. Add branching if a single transform family cannot cover all series
+
+  include_artifacts: true
+  max_artifact_bytes: 16384
+
+# ── Database (MAP-Elites) ────────────────────────────────────────────────────
+database:
+  population_size: 60
+  archive_size: 40
+  num_islands: 3
+  elite_selection_ratio: 0.20
+  exploration_ratio: 0.10
+  exploitation_ratio: 0.70
+
+  # Diversity axis: code diversity (OpenEvolve computes automatically)
+  feature_dimensions: ["diversity"]
+  feature_bins: 8
+
+  similarity_threshold: 0.95
+  log_prompts: true
+
+# ── Evaluator ────────────────────────────────────────────────────────────────
+evaluator:
+  timeout: 300
+  cascade_evaluation: true
+  cascade_thresholds: [0.3]   # Stage 1 validity gate (low bar)
+  parallel_evaluations: 1     # Chronos holds GPU memory — 1 at a time
+
+# ── Evolution ────────────────────────────────────────────────────────────────
+diff_based_evolution: false
+max_code_length: 15000

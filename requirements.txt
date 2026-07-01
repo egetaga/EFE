@@ -1,0 +1,25 @@
+# Core framework deps (also declared in pyproject.toml)
+numpy>=1.22.0
+pandas
+pyyaml>=6.0
+scikit-learn
+openai>=1.0.0
+tqdm>=4.64.0
+flask
+dacite>=1.9.2
+
+# Bedrock LLM provider
+boto3
+
+# EFE-Tab
+tabpfn
+lightgbm
+optuna
+
+# EFE-Time
+torch
+scipy
+chronos-forecasting
+
+# GIFT-Eval (used by EFE-Time, install separately):
+# pip install "git+https://github.com/SalesforceAIResearch/gift-eval.git"

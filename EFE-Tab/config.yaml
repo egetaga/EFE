@@ -1,0 +1,173 @@
+# EFE-Tab config.
+#
+# The LLM-evolved program exposes fit(X, y) → state and
+# transform(X, state) → DataFrame. This validator allows the LLM to
+# DROP original column or add new columns; in-place modification of any kept original is
+# rejected (originals must remain byte-identical).
+#
+# Run with:
+#   python openevolve-run.py \
+#     EFE-Tab/initial_program.py \
+#     EFE-Tab/evaluator.py \
+#     --config EFE-Tab/config.yaml \
+#     --output EFE-Tab/openevolve_output
+#
+# Authentication (pick one):
+#   Option A — Bedrock API Key (ABSK token):
+#     export AWS_BEARER_TOKEN_BEDROCK="your-ABSK-token"
+#
+#   Option B — Standard AWS credentials:
+#     export AWS_ACCESS_KEY_ID="..."
+#     export AWS_SECRET_ACCESS_KEY="..."
+#     export AWS_SESSION_TOKEN="..."  # optional
+#     Also: pip install boto3
+#
+# Set TABARENA_TASK to choose the dataset.
+# Set CART_HPO_TRIALS / TREE_HPO_TRIALS to tune CART HPO budget.
+
+max_iterations: 100
+checkpoint_interval: 10
+language: python
+
+# ── LLM (AWS Bedrock) ──────────────────────────────────────────────────────
+llm:
+  provider: bedrock
+  region: us-east-1
+  primary_model: "us.anthropic.claude-opus-4-6-v1"
+  primary_model_weight: 1.0
+  secondary_model: "us.anthropic.claude-sonnet-4-6"
+  secondary_model_weight: 0.0
+  api_key: "${AWS_BEARER_TOKEN_BEDROCK}"
+  temperature: 0.7
+  max_tokens: 8192
+  timeout: 120
+
+# ── Prompt ───────────────────────────────────────────────────────────────────
+prompt:
+  system_message: |
+    You are an expert data scientist. You are designing a feature engineering
+    pipeline for tabular binary classification. Your goal is to improve the AUC
+    of the model. Think carefully and step-by-step before responding.
+
+    You are allowed to create new features from the originals, and to drop the originals.
+    You are not allowed to train any machine learning model inside fit(),
+    store a model in the state dict, or mutate the input DataFrame in place.
+    Do not standardize the data — it is unnecessary for the models you are using.
+    Pay attention to the domain context (column names and descriptions), the
+    decision tree, and the permutation importance reports.
+    Comment your code to explain your decisions. You should state your reasoning for each decision.
+
+    The program you are designing has two methods:
+    1. fit(X, y) → state dict — compute statistics from TRAINING data only
+    2. transform(X, state) → DataFrame — generate features using fitted state
+
+    In fit(), compute and store any statistics you need.
+    In transform(), use the state to build / mutate features.
+
+    Allowed operations:
+    - Arithmetic combining TWO OR MORE columns: sums, differences, products, ratios
+    - Centered/z-scored interactions using training-fitted statistics from state
+    - Rank-based interactions using training quantiles from state
+    - Row-wise aggregates: NaN count, zero count, sum across columns
+    - Target-rate mapping: per-category target rate from fit() applied in transform()
+    - Residual features: col_A minus its predicted value from col_B (fitted in fit())
+    - String/categorical: length, token count, pattern match, category crossing
+    - Datetime: year, month, day, weekday, elapsed differences
+    - Parsing string-encoded ordinals into integers  (e.g. "<1" / ">20" → 0 / 21)
+    - Dropping an original column you have strong evidence is irrelevant
+      (id-like, constant, or flagged as noise/HARMFUL by perm importance)
+    - Make sure you are not dividing by zero.
+
+
+    FORBIDDEN:
+    - Training any ML model inside fit() (no LightGBM, no LogReg, no sklearn
+      classifiers / regressors, etc.)
+    - Storing fitted ML models in the state dict (state must remain a plain
+      lightweight dict — see STATE DICT RULES below)
+    - Modifying an original column in place — keep originals byte-identical.
+      If you want a cleaned/encoded version, add it as a NEW column with a
+      different name; drop the original only if you don't need it.
+    - Mutating the input DataFrame in place — always copy first
+     
+    STATE DICT RULES:
+    - Must be a plain dict (returned from fit())
+    - Values should be simple types: int, float, str, list, dict, numpy arrays
+    - Do NOT store DataFrames, models, or non-serializable objects in state
+
+    USE THE CONTEXT:
+    The artifacts include a "dataset_context" with column names, data types,
+    value ranges, and a dataset description. READ IT CAREFULLY:
+    - ONLY use column names that appear in the dataset_context
+    - Read column names to understand what each represents to create
+      domain-relevant interactions
+    - Read the dataset description for domain reasoning, including domain
+      quirks 
+    - Check data types before applying operations
+    - Use the decision tree to understand which features drive the splits.
+      Features near the root are the most important; features that appear
+      anywhere in the tree carry signal.
+    - Use the permutation importance over ORIGINAL features to judge which
+      raw columns matter on their own. Consider dropping or replacing any
+      flagged as HARMFUL.  
+    - Use the permutation importance over NEW features to judge which of
+      your engineered columns earned their cost. Drop new columns flagged as noise or HARMFUL
+    - Think like an expert data scientist: use the context, domain knowledge, statistics, and
+      feedback artifacts to reason about what drives the predictions, then
+      engineer accordingly.
+
+
+    FEEDBACK YOU WILL RECEIVE:
+    1. Dataset context: Column names, dtypes, value ranges, description
+       
+    2. Stage 2 summary: baseline_cv_auc, candidate_cv_auc, delta_vs_baseline,
+       combined_score, AND new_cols / dropped_original_cols lists so you can
+       see exactly which original columns were dropped vs kept and which
+       fresh columns were added.
+
+    3. Decision tree: depth-3 tree on all output features. Features that are closest to the root of the tree are the most
+       important. Features that exist in the tree are also important. Use this to understand which
+       features are important and which are not. Use this to understand how to combine features
+       to create new features that are important.
+
+    4. Permutation importance over ORIGINAL features: AUC drop per raw
+       column when shuffled. Computed once at the start of the run.
+       USEFUL (>0.005), marginal (0.001-0.005), noise (~0), HARMFUL (<-0.001).
+       Drop or replace features labeled HARMFUL. Do not drop features labeled USEFUL, marginal or noise.
+
+    5. Permutation importance over NEW features: AUC drop per engineered
+       column when shuffled. Computed every evaluation.
+       USEFUL (>0.005), marginal (0.001-0.005), noise (~0), HARMFUL (<-0.001).
+       Drop NEW features that are noise or HARMFUL.
+
+    SCORING:
+    total_changes = n_drops + n_new_cols
+    Your score = 0.5 + (CV AUC improvement over baseline) x 5 - 0.10 * sqrt(total_changes / n_rows)
+
+
+
+  include_artifacts: true
+  max_artifact_bytes: 20480
+
+database:
+  population_size: 50
+  archive_size: 25
+  num_islands: 3
+  elite_selection_ratio: 0.20
+  exploration_ratio: 0.10
+  exploitation_ratio: 0.70
+  feature_dimensions: ["generated_feature_count", "diversity"]
+  feature_bins: 8
+
+  similarity_threshold: 0.95
+  log_prompts: true
+
+# ── Evaluator ────────────────────────────────────────────────────────────────
+evaluator:
+  timeout: 1800
+  cascade_evaluation: true
+  cascade_thresholds: [0.4]
+  parallel_evaluations: 2
+
+# ── Evolution ────────────────────────────────────────────────────────────────
+diff_based_evolution: false
+max_code_length: 15000
