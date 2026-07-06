@@ -79,10 +79,14 @@ Method-specific setup details are available in `EFE-Time/README.md`, `EFE-Tab/RE
 If you use this repository, please cite:
 
 ```bibtex
-@misc{taga2026evolutionary,
-  title  = {Evolutionary Feature Engineering for Structured Data},
-  author = {Taga, Ege Onur and Zhuang, Yilin and Ildiz, M. Emrullah and Mol, Petros and Das, Abhimanyu and Duraisamy, Karthik and Oymak, Samet},
-  year   = {2026}
+@misc{taga2026evolutionaryfeatureengineeringstructured,
+      title={Evolutionary Feature Engineering for Structured Data}, 
+      author={Ege Onur Taga and Yilin Zhuang and M. Emrullah Ildiz and Petros Mol and Abhimanyu Das and Karthik Duraisamy and Samet Oymak},
+      year={2026},
+      eprint={2607.01548},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2607.01548}, 
 }
 ```
 
